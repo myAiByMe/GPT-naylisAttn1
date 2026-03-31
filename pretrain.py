@@ -84,7 +84,7 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 32,
     # Training
-    'batch_size'            : 62,
+    'batch_size'            : 48,
     'gradient_accumulation' : 2,   # batch effectif = 62×2×1024 ≈ 127k tokens
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
