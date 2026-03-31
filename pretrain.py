@@ -5,7 +5,7 @@ pretrain.py — GPT-Naylis v1 (benchmark)
 Pretrain NaylisGPT ~200M params sur Cosmopedia v2 (4 chunks × 1B tokens).
 
 STACK :
-  - Tokenizer   : tokenizer_gnt (vocab 49158 avec tokens spéciaux)
+  - Tokenizer   : cosmo2 + 6 tokens spéciaux (vocab 49158)
   - Attention   : NaylisAttention (SDPA/FA + graph bias asymétrique)
   - Optimiseur  : Muon+MARS-M (blocs) + AdamW (embeddings, norms)
   - Scheduler   : WSD (Warmup-Stable-Decay)
@@ -36,7 +36,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from functools import partial
 from datetime import datetime
-from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from typing import Optional, List
@@ -84,15 +83,15 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 32,
     # Training
-    'batch_size'            : 48,
-    'gradient_accumulation' : 2,   # batch effectif = 62×2×1024 ≈ 127k tokens
+    'batch_size'            : 8,
+    'gradient_accumulation' : 32,   # batch effectif = 48×2×1024 
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
     'adam_beta1'            : 0.9,
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
-    'num_epochs'            : 1,             # 1 chunk par epoch = 4B tokens total
+    'num_epochs'            : 2,             # 1 chunk par epoch = 4B tokens total
     'chunks_per_epoch'      : 1,
     # Data
     'data_dir'              : './data_exp',
@@ -123,20 +122,20 @@ if DEVICE == 'cuda':
     cap = torch.cuda.get_device_capability()
     print(f'  SM   : {cap[0]}{cap[1]}')
 print(f'  embed={CONFIG["embed_dim"]}  layers={CONFIG["num_layers"]}  '
-      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}')
+      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]} batch_size={CONFIG["batch_size"]} gradient_acc={CONFIG["gradient_accumulation"]}')
 
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 print('\nTokenizer...')
-_tok_dir = Path('./data_exp/tokenizer_gnt')
-if _tok_dir.exists():
-    tokenizer = AutoTokenizer.from_pretrained(str(_tok_dir))
-    print(f'  Tokenizer GNT chargé : vocab={len(tokenizer)}')
-else:
-    print('  ⚠️  Tokenizer GNT non trouvé — utilisation cosmo2 de base')
-    tokenizer = AutoTokenizer.from_pretrained('HuggingFaceTB/cosmo2-tokenizer')
+tokenizer = AutoTokenizer.from_pretrained('HuggingFaceTB/cosmo2-tokenizer')
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+
+# Tokens spéciaux ajoutés dans les slots libres du vocabulaire cosmo2
+tokenizer.add_special_tokens({
+    'additional_special_tokens': ['<think>', '</think>', '<code>', '</code>', '<output>', '</output>']
+})
+
 CONFIG['vocab_size'] = len(tokenizer)
 EOS_ID         = tokenizer.eos_token_id
 THINK_START_ID = tokenizer.convert_tokens_to_ids('<think>')
@@ -160,7 +159,7 @@ def scan_chunks(data_dir: str) -> list:
         chunk_dir = os.path.join(data_dir, entry)
         if not os.path.isdir(chunk_dir) or not entry.startswith('chunk'):
             continue
-        # Priorité tokens.npy (GNT), fallback cosmopedia.npy
+        # Priorité tokens.npy, fallback cosmopedia.npy
         npy_file = os.path.join(chunk_dir, 'tokens.npy')
         if not os.path.exists(npy_file):
             npy_file = os.path.join(chunk_dir, 'cosmopedia.npy')
