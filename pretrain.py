@@ -5,7 +5,7 @@ pretrain.py — GPT-Naylis v1 (benchmark)
 Pretrain NaylisGPT ~200M params sur Cosmopedia v2 (4 chunks × 1B tokens).
 
 STACK :
-  - Tokenizer   : cosmo2 + 6 tokens spéciaux (vocab 49158)
+  - Tokenizer   : tokenizer_gnt (vocab 49158 avec tokens spéciaux)
   - Attention   : NaylisAttention (SDPA/FA + graph bias asymétrique)
   - Optimiseur  : Muon+MARS-M (blocs) + AdamW (embeddings, norms)
   - Scheduler   : WSD (Warmup-Stable-Decay)
@@ -36,6 +36,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from functools import partial
 from datetime import datetime
+from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from typing import Optional, List
@@ -82,17 +83,19 @@ CONFIG = {
     'soft_cap'              : None,
     'use_flash_attn'        : True,
     'rel_rank'              : 32,
+    # Tokens spéciaux — si False, THINK/CODE/OUTPUT IDs sont ignorés dans le training
+    'use_token_special'     : False,
     # Training
     'batch_size'            : 8,
-    'gradient_accumulation' : 32,   # batch effectif = 48×2×1024 
+    'gradient_accumulation' : 32,   # batch effectif = 32×8×1024
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
     'adam_beta1'            : 0.9,
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
-    'num_epochs'            : 2,             # 1 chunk par epoch = 4B tokens total
-    'chunks_per_epoch'      : 1,
+    'num_epochs'            : 1,             # 2 chunks par epoch = 2B tokens total
+    'chunks_per_epoch'      : 2,
     # Data
     'data_dir'              : './data_exp',
     'val_tokens'            : 10_000_000,    # 10M tokens validation par chunk
@@ -122,33 +125,46 @@ if DEVICE == 'cuda':
     cap = torch.cuda.get_device_capability()
     print(f'  SM   : {cap[0]}{cap[1]}')
 print(f'  embed={CONFIG["embed_dim"]}  layers={CONFIG["num_layers"]}  '
-      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]} batch_size={CONFIG["batch_size"]} gradient_acc={CONFIG["gradient_accumulation"]}')
+      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]} '
+      f'batch_size={CONFIG["batch_size"]} gradient_acc={CONFIG["gradient_accumulation"]}  '
+      f'token_special={CONFIG["use_token_special"]}')
 
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 print('\nTokenizer...')
 tokenizer = AutoTokenizer.from_pretrained('HuggingFaceTB/cosmo2-tokenizer')
+print(f'  cosmo2-tokenizer chargé : vocab de base={len(tokenizer)}')
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+EOS_ID = tokenizer.eos_token_id
 
-# Tokens spéciaux ajoutés dans les slots libres du vocabulaire cosmo2
-tokenizer.add_special_tokens({
-    'additional_special_tokens': ['<think>', '</think>', '<code>', '</code>', '<output>', '</output>']
-})
+# ── Tokens spéciaux (conditionnels) ──────────────────────────────────────────
+# Si True  → add_special_tokens() étend le vocab (+6 IDs) et CONFIG['vocab_size'] en tient compte
+# Si False → tokenizer cosmo2 brut, aucun token ajouté
+SPECIAL_TOKENS = ['<think>', '</think>', '<code>', '</code>', '<o>', '</o>']
 
+if CONFIG['use_token_special']:
+    added = tokenizer.add_special_tokens({'additional_special_tokens': SPECIAL_TOKENS})
+    print(f'  {added} token(s) spéciaux ajoutés → vocab={len(tokenizer)}')
+    THINK_START_ID = tokenizer.convert_tokens_to_ids('<think>')
+    THINK_END_ID   = tokenizer.convert_tokens_to_ids('</think>')
+    CODE_START_ID  = tokenizer.convert_tokens_to_ids('<code>')
+    CODE_END_ID    = tokenizer.convert_tokens_to_ids('</code>')
+    OUT_START_ID   = tokenizer.convert_tokens_to_ids('<o>')
+    OUT_END_ID     = tokenizer.convert_tokens_to_ids('</o>')
+    print(f'  eos={EOS_ID}')
+    print(f'  <think>={THINK_START_ID}  </think>={THINK_END_ID}')
+    print(f'  <code>={CODE_START_ID}  </code>={CODE_END_ID}')
+    print(f'  <o>={OUT_START_ID}  </o>={OUT_END_ID}')
+else:
+    THINK_START_ID = THINK_END_ID = None
+    CODE_START_ID  = CODE_END_ID  = None
+    OUT_START_ID   = OUT_END_ID   = None
+    print(f'  vocab={len(tokenizer)}  eos={EOS_ID}')
+    print(f'  use_token_special=False — aucun token spécial ajouté')
+
+# vocab_size mis à jour APRÈS l'éventuel add_special_tokens
 CONFIG['vocab_size'] = len(tokenizer)
-EOS_ID         = tokenizer.eos_token_id
-THINK_START_ID = tokenizer.convert_tokens_to_ids('<think>')
-THINK_END_ID   = tokenizer.convert_tokens_to_ids('</think>')
-CODE_START_ID  = tokenizer.convert_tokens_to_ids('<code>')
-CODE_END_ID    = tokenizer.convert_tokens_to_ids('</code>')
-OUT_START_ID   = tokenizer.convert_tokens_to_ids('<output>')
-OUT_END_ID     = tokenizer.convert_tokens_to_ids('</output>')
-print(f'  vocab={len(tokenizer)}  eos={EOS_ID}')
-print(f'  <think>={THINK_START_ID}  </think>={THINK_END_ID}')
-print(f'  <code>={CODE_START_ID}  </code>={CODE_END_ID}')
-print(f'  <output>={OUT_START_ID}  </output>={OUT_END_ID}')
-
 
 # ── Chunk scan ───────────────────────────────────────────────────────────────
 def scan_chunks(data_dir: str) -> list:
@@ -159,7 +175,7 @@ def scan_chunks(data_dir: str) -> list:
         chunk_dir = os.path.join(data_dir, entry)
         if not os.path.isdir(chunk_dir) or not entry.startswith('chunk'):
             continue
-        # Priorité tokens.npy, fallback cosmopedia.npy
+        # Priorité tokens.npy (GNT), fallback cosmopedia.npy
         npy_file = os.path.join(chunk_dir, 'tokens.npy')
         if not os.path.exists(npy_file):
             npy_file = os.path.join(chunk_dir, 'cosmopedia.npy')
@@ -557,7 +573,8 @@ def train_one_chunk(
 
     total_batches = total_seqs // CONFIG['batch_size']
     print(f'  batches={total_batches:,}  restant={len(train_loader):,}  '
-          f'packing={"ON" if CONFIG["use_packing"] else "OFF"}')
+          f'packing={"ON" if CONFIG["use_packing"] else "OFF"}  '
+          f'token_special={"ON" if CONFIG["use_token_special"] else "OFF"}')
 
     model.train()
     ae, adt       = (DEVICE == 'cuda'), torch.bfloat16
