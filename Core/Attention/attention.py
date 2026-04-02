@@ -373,7 +373,7 @@ class NaylisAttention(nn.Module):
         # En decode (S=1 + KV cache) : pas de graph_bias
         # car x=[B,1,D] → on ne peut pas calculer R_k sur S_total
         # Le biais est appliqué uniquement en prefill (S>1)
-        _use_graph = (not use_varlen) and S > 1
+        _use_graph = (not use_varlen) and (S > 1 or past_kv is None)
         graph_bias = (
             self._compute_graph_bias(x, q.dtype) if _use_graph else None
         )
@@ -399,16 +399,46 @@ class NaylisAttention(nn.Module):
             output = output.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
         elif self._sdpa_ok and self.soft_cap is None:
-            # SDPA prioritaire — PyTorch 2.5+ supporte attn_mask + is_causal=True simultanément
-            # Le kernel fusionne les deux sans allocation de masque causal (SM120 optimisé)
+            # SDPA prioritaire — graph_bias injecté via attn_mask
+            # Si S=1 (decode) : graph_bias [B,H,1,S_kv], is_causal=False
+            # Si S>1 (prefill) : graph_bias [B,H,S,S] + masque causal fusionné
             is_causal = (S > 1 and past_kv is None)
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask = graph_bias.contiguous() if graph_bias is not None else None,
-                is_causal = is_causal,
-                dropout_p = self.dropout.p if self.training else 0.0,
-                scale     = scale,
-            )
+
+            if is_causal and graph_bias is not None:
+                # Fusionne graph_bias + masque causal dans attn_mask
+                # SDPA avec attn_mask explicite désactive is_causal interne
+                S_q, S_kv = q.shape[2], k.shape[2]
+                causal_mask = torch.triu(
+                    torch.full((S_q, S_kv), float('-inf'),
+                               device=q.device, dtype=q.dtype),
+                    diagonal=1 + (past_kv[0].shape[2] if past_kv else 0),
+                )
+                attn_mask = (graph_bias + causal_mask.unsqueeze(0).unsqueeze(0)).contiguous()
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask = attn_mask,
+                    is_causal = False,
+                    dropout_p = self.dropout.p if self.training else 0.0,
+                    scale     = scale,
+                )
+            elif graph_bias is not None:
+                # Decode (S=1) — .contiguous() obligatoire pour SDPA
+                graph_bias = graph_bias.contiguous()
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask = graph_bias,
+                    is_causal = False,
+                    dropout_p = self.dropout.p if self.training else 0.0,
+                    scale     = scale,
+                )
+            else:
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask = None,
+                    is_causal = is_causal,
+                    dropout_p = self.dropout.p if self.training else 0.0,
+                    scale     = scale,
+                )
 
         elif self._fa_func is not None and self.soft_cap is None and mask is None:
             # FA std fallback (PyTorch < 2.0) — sans graph_bias
