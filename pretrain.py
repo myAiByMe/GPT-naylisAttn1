@@ -86,8 +86,8 @@ CONFIG = {
     # Tokens spéciaux — si False, THINK/CODE/OUTPUT IDs sont ignorés dans le training
     'use_token_special'     : False,
     # Training
-    'batch_size'            : 8,
-    'gradient_accumulation' : 32,   # batch effectif = 32×8×1024
+    'batch_size'            : 32,
+    'gradient_accumulation' : 8,   # batch effectif = 32×8×1024
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
