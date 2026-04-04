@@ -113,7 +113,7 @@ CONFIG = {
     'compile_mode'          : ARGS.compile_mode,
     # DataLoader
     'num_workers'           : 1,
-    'use_packing'           : True,
+    'use_packing'           : False,
 }
 
 print('=' * 70)
