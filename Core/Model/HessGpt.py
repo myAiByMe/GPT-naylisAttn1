@@ -165,14 +165,22 @@ class NaylisGPT(nn.Module):
     def generate(
         self,
         input_ids     : torch.Tensor,
-        max_new_tokens: int            = 50,
-        temperature   : float          = 1.0,
-        top_k         : Optional[int]  = None,
-        top_p         : Optional[float]= None,
-        eos_token_id  : Optional[int]  = None,
+        max_new_tokens: int                          = 50,
+        temperature   : float                        = 1.0,
+        top_k         : Optional[int]                = None,
+        top_p         : Optional[float]              = None,
+        eos_token_id  : Optional[int | List[int]]    = None,  # accepte int ou liste
     ) -> torch.Tensor:
         was_training = self.training
         self.eval()
+
+        # Normalise eos_token_id en set pour le test d'appartenance O(1)
+        if eos_token_id is None:
+            eos_ids = None
+        elif isinstance(eos_token_id, int):
+            eos_ids = {eos_token_id}
+        else:
+            eos_ids = set(eos_token_id)
 
         with torch.no_grad():
             if input_ids.size(1) > self.max_seq_len:
@@ -200,7 +208,8 @@ class NaylisGPT(nn.Module):
 
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
-                if eos_token_id is not None and (next_token == eos_token_id).all():
+                # Arrêt si le token généré est dans eos_ids (int ou liste)
+                if eos_ids is not None and next_token.item() in eos_ids:
                     break
 
                 decode_logits, _, past_kv = self.forward(
