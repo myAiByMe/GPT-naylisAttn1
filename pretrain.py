@@ -80,7 +80,7 @@ CONFIG = {
     'vocab_size'            : None,           # rempli après tokenizer
     'embed_dim'             : 768,
     'num_heads'             : 12,
-    'num_layers'            : 18,
+    'num_layers'            : 32,
     'max_seq_len'           : 1024,
     'dropout'               : 0.0,
     'use_rope'              : True,
@@ -92,7 +92,7 @@ CONFIG = {
     'use_qk_norm'           : True,
     'soft_cap'              : None,
     'use_flash_attn'        : True,
-    'rel_rank'              : 32,
+    'rel_rank'              : 16,
     # Tokens spéciaux
     'use_token_special'     : False,
     # Training
