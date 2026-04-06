@@ -2,10 +2,10 @@
 """
 pretrain.py — GPT-Naylis v1 (benchmark)
 ========================
-Pretrain NaylisGPT ~200M params sur Cosmopedia v2 (4 chunks × 1B tokens).
+Pretrain NaylisGPT ~200M params sur Cosmopedia v2.
 
 STACK :
-  - Tokenizer   : tokenizer_gnt (vocab 49158 avec tokens spéciaux)
+  - Tokenizer   : cosmo2-tokenizer (vocab 49152)
   - Attention   : NaylisAttention (SDPA/FA + graph bias asymétrique)
   - Optimiseur  : Muon+MARS-M (blocs) + AdamW (embeddings, norms)
   - Scheduler   : WSD (Warmup-Stable-Decay)
@@ -13,9 +13,16 @@ STACK :
   - Mmap        : np.load(mmap_mode='r') → ~400MB RAM par chunk actif
   - Checkpoint  : sauvegarde atomique + reprise automatique
 
+SYSTÈME CHUNKS :
+  - Linéaire : chunk_000 → chunk_001 → chunk_002 → ...
+  - Si chunk déjà traité → skip automatique
+  - Reprise mid-chunk : reprend exactement où ça s'était arrêté
+  - Save final garanti après le dernier chunk
+
 USAGE :
   python pretrain.py
   python pretrain.py --no-compile
+  python pretrain.py --total-steps 45732   # reprise avec scheduler original
 """
 
 import os
@@ -59,6 +66,9 @@ def get_args():
     p.add_argument('--no-compile',   action='store_true')
     p.add_argument('--compile-mode', default='default',
                    choices=['default', 'reduce-overhead', 'max-autotune'])
+    p.add_argument('--total-steps',  type=int, default=None,
+                   help='Forcer total_steps du scheduler WSD (reprise mid-training). '
+                        'Ex: --total-steps 45732')
     return p.parse_args()
 
 ARGS   = get_args()
@@ -71,38 +81,36 @@ CONFIG = {
     'embed_dim'             : 768,
     'num_heads'             : 12,
     'num_layers'            : 18,
-    'max_seq_len'           : 1024,   # aligné GNT benchmark
+    'max_seq_len'           : 1024,
     'dropout'               : 0.0,
     'use_rope'              : True,
     'use_yarn'              : False,
     'yarn_scale'            : 1.0,
-    'yarn_original_max_len' : 1024,   # référence pour YaRN en SFT
+    'yarn_original_max_len' : 1024,
     'use_swiglu'            : True,
     'n_kv_heads'            : 4,
     'use_qk_norm'           : True,
     'soft_cap'              : None,
     'use_flash_attn'        : True,
     'rel_rank'              : 32,
-    # Tokens spéciaux — si False, THINK/CODE/OUTPUT IDs sont ignorés dans le training
+    # Tokens spéciaux
     'use_token_special'     : False,
     # Training
     'batch_size'            : 32,
-    'gradient_accumulation' : 8,   # batch effectif = 32×8×1024
+    'gradient_accumulation' : 8,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
     'adam_beta1'            : 0.9,
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
-    'num_epochs'            : 1,             # 2 chunks par epoch = 2B tokens total
-    'chunks_per_epoch'      : 2,
     # Data
     'data_dir'              : './data_exp',
-    'val_tokens'            : 10_000_000,    # 10M tokens validation par chunk
+    'val_tokens'            : 10_000_000,
     'warmup_ratio'          : 0.03,
     'decay_ratio'           : 0.15,
     'min_lr_ratio'          : 0.1,
-    # Validation
+    # Validation / Save
     'validate_every_steps'  : 500,
     'val_batches'           : 50,
     'save_every_steps'      : 2000,
@@ -138,9 +146,6 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 EOS_ID = tokenizer.eos_token_id
 
-# ── Tokens spéciaux (conditionnels) ──────────────────────────────────────────
-# Si True  → add_special_tokens() étend le vocab (+6 IDs) et CONFIG['vocab_size'] en tient compte
-# Si False → tokenizer cosmo2 brut, aucun token ajouté
 SPECIAL_TOKENS = ['<think>', '</think>', '<code>', '</code>', '<o>', '</o>']
 
 if CONFIG['use_token_special']:
@@ -163,11 +168,12 @@ else:
     print(f'  vocab={len(tokenizer)}  eos={EOS_ID}')
     print(f'  use_token_special=False — aucun token spécial ajouté')
 
-# vocab_size mis à jour APRÈS l'éventuel add_special_tokens
 CONFIG['vocab_size'] = len(tokenizer)
+
 
 # ── Chunk scan ───────────────────────────────────────────────────────────────
 def scan_chunks(data_dir: str) -> list:
+    """Scanne data_dir et retourne tous les chunks disponibles, triés par ID."""
     available = []
     if not os.path.exists(data_dir):
         return available
@@ -175,7 +181,6 @@ def scan_chunks(data_dir: str) -> list:
         chunk_dir = os.path.join(data_dir, entry)
         if not os.path.isdir(chunk_dir) or not entry.startswith('chunk'):
             continue
-        # Priorité tokens.npy (GNT), fallback cosmopedia.npy
         npy_file = os.path.join(chunk_dir, 'tokens.npy')
         if not os.path.exists(npy_file):
             npy_file = os.path.join(chunk_dir, 'cosmopedia.npy')
@@ -196,17 +201,11 @@ ALL_CHUNKS = scan_chunks(CONFIG['data_dir'])
 if not ALL_CHUNKS:
     print(f'\nERREUR : aucun chunk dans {CONFIG["data_dir"]}')
     print('  → Lancer dataset.py d\'abord')
-    import sys; sys.exit(1)
+    sys.exit(1)
 
 print(f'\n  {len(ALL_CHUNKS)} chunks disponibles :')
 for c in ALL_CHUNKS:
     print(f'    chunk_{c["id"]:03d} : {c["tokens"] / 1e9:.3f}B tokens')
-
-TOTAL_CHUNKS_USED = min(
-    CONFIG['num_epochs'] * CONFIG['chunks_per_epoch'],
-    len(ALL_CHUNKS)
-)
-ALL_TRAIN_CHUNKS = ALL_CHUNKS[:TOTAL_CHUNKS_USED]
 
 
 def steps_for_chunk(n_tokens: int) -> int:
@@ -215,8 +214,8 @@ def steps_for_chunk(n_tokens: int) -> int:
     return max(math.ceil(batches / CONFIG['gradient_accumulation']), 1)
 
 
-TOTAL_STEPS = sum(steps_for_chunk(c['tokens']) for c in ALL_TRAIN_CHUNKS)
-print(f'  Total steps estimés : {TOTAL_STEPS:,}')
+TOTAL_STEPS = sum(steps_for_chunk(c['tokens']) for c in ALL_CHUNKS)
+print(f'  Total steps estimés (tous chunks) : {TOTAL_STEPS:,}')
 
 
 # ── WSD Scheduler ────────────────────────────────────────────────────────────
@@ -248,7 +247,6 @@ class WSDScheduler:
         self.current_step += 1
         for opt in self.optimizers:
             for pg in opt.param_groups:
-                # Muon reçoit lr×5 — seule source du multiplicateur (init lr=lr dans configure_optimizers)
                 pg['lr'] = lr * 5.0 if pg.get('is_muon', False) else lr
         return lr
 
@@ -259,7 +257,6 @@ class WSDScheduler:
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
 class ChunkDataset(Dataset):
-    """Dataset standard — pas de packing."""
     def __init__(self, tokens: torch.Tensor, seq_len: int):
         n = len(tokens) // (seq_len + 1)
         self.tokens  = tokens[:n * (seq_len + 1)].share_memory_()
@@ -275,7 +272,6 @@ class ChunkDataset(Dataset):
 
 
 class PackedChunkDataset(Dataset):
-    """Sequence packing — 0% padding."""
     def __init__(self, tokens: torch.Tensor, seq_len: int, eos_token_id: int):
         n = len(tokens) // (seq_len + 1)
         self.tokens       = tokens[:n * (seq_len + 1)].share_memory_()
@@ -313,18 +309,14 @@ def packed_collate_fn(batch, eos_token_id: int, seq_len: int):
 
 
 class LazyChunk:
-    """Charge un chunk .npy — RAM directe si possible, mmap sinon."""
     def __init__(self, chunk_info: dict, seq_len: int, val_tokens: int):
         print(f'  Chargement chunk_{chunk_info["id"]:03d}...')
         t0 = time.time()
-
-        # Essaie RAM directe d'abord — plus rapide, pas de lag disque
-        # Fallback mmap si MemoryError (5GB RAM libre insuffisant)
         try:
-            arr  = np.load(chunk_info['file'])   # RAM directe
+            arr  = np.load(chunk_info['file'])
             mode = 'RAM'
         except MemoryError:
-            print('  MemoryError → fallback mmap (attendu si RAM < 5GB libre)')
+            print('  MemoryError → fallback mmap')
             arr  = np.load(chunk_info['file'], mmap_mode='r')
             mode = 'mmap'
 
@@ -335,12 +327,10 @@ class LazyChunk:
         n_seqs    = total // seq_len_1
         ram_gb    = tokens.element_size() * total / 1e9
 
-        # Shuffle reproductible
-        rng    = np.random.default_rng(42 + chunk_info['id'])  # seed fixe par chunk — reproductible à la reprise
+        rng    = np.random.default_rng(42 + chunk_info['id'])
         idx    = rng.permutation(n_seqs)
         tokens = tokens[:n_seqs * seq_len_1].reshape(n_seqs, seq_len_1)[idx].reshape(-1)
 
-        # Split train / val
         val_size   = min(val_tokens, int(total * 0.05))
         train_size = total - val_size
         self._train = tokens[:train_size]
@@ -372,7 +362,7 @@ class CheckpointManager:
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
 
     def save(self, model, optimizers, scheduler, metadata: dict):
-        m         = model._orig_mod if hasattr(model, '_orig_mod') else model
+        m           = model._orig_mod if hasattr(model, '_orig_mod') else model
         muon, adamw = optimizers
         cp = {
             'model_state_dict'    : m.state_dict(),
@@ -389,7 +379,7 @@ class CheckpointManager:
         torch.save(cp, tmp_pt)
         os.replace(tmp_pt, self.path)
         os.replace(tmp_json, info_path)
-        print(f'  💾 SAVE  step={metadata["global_step"]:,}  [{self.path}]')
+        print(f'  💾 SAVE  step={metadata["global_step"]:,}  chunk_idx={metadata["current_chunk_idx"]}  [{self.path}]')
 
     def load(self) -> Optional[dict]:
         if not os.path.exists(self.path):
@@ -400,13 +390,22 @@ class CheckpointManager:
         if os.path.exists(info_path):
             with open(info_path, 'r') as f:
                 info = json.load(f)
-            for k in ('global_step', 'current_epoch', 'chunk_within_epoch',
-                      'total_training_time', 'chunk_start_step'):
+            # Compatibilité ancien format (epoch/cwi) → nouveau format (chunk_idx)
+            if 'current_chunk_idx' not in info:
+                # Reconstruction depuis l'ancien format
+                old_epoch = info.get('current_epoch', 1)
+                old_cwi   = info.get('chunk_within_epoch', 0)
+                chunks_per_epoch = info.get('config', {}).get('chunks_per_epoch', 2)
+                reconstructed_idx = (old_epoch - 1) * chunks_per_epoch + old_cwi
+                info['current_chunk_idx'] = reconstructed_idx
+                info['chunk_start_step']  = info.get('chunk_start_step', 0)
+                print(f'  ⚠️  Ancien format détecté (epoch={old_epoch} cwi={old_cwi}) '
+                      f'→ chunk_idx={reconstructed_idx} (reconstruction)')
+            for k in ('global_step', 'current_chunk_idx', 'total_training_time', 'chunk_start_step'):
                 cp[k] = info.get(k, 0)
         else:
-            cp.update({'global_step': 0, 'current_epoch': 1,
-                       'chunk_within_epoch': 0, 'total_training_time': 0.0,
-                       'chunk_start_step': 0})
+            cp.update({'global_step': 0, 'current_chunk_idx': 0,
+                       'total_training_time': 0.0, 'chunk_start_step': 0})
         return cp
 
 
@@ -495,10 +494,9 @@ def configure_optimizers(model, lr: float, weight_decay: float, betas, eps):
         else:
             adamw_nodecay.append(p)
 
-    lr_muon  = lr  # le scheduler applique ×5 via is_muon
     muon_opt = Muon(
         [{'params': muon_params, 'is_muon': True}],
-        lr=lr_muon, momentum=0.95, nesterov=True,
+        lr=lr, momentum=0.95, nesterov=True,
         ns_steps=3, weight_decay=0.0, use_mars=True, mars_gamma=0.025,
     )
     muon_opt.param_groups[0]['is_muon'] = True
@@ -519,16 +517,18 @@ def train_one_chunk(
     model, chunk_info: dict, optimizers, scheduler,
     ckpt_mgr: CheckpointManager, history: dict,
     global_step: int, total_time: float,
-    current_epoch: int, cwi: int, chunk_start_step: int,
+    chunk_idx: int, chunk_start_step: int,
+    is_resume: bool,
 ) -> tuple:
-
+    """
+    Entraîne sur un chunk.
+    Retourne (global_step, total_time, chunk_start_step).
+    Lève une exception si erreur fatale (KeyboardInterrupt géré à l'extérieur).
+    """
     muon_opt, adamw_opt = optimizers
-    steps_done   = global_step - chunk_start_step
-    batches_done = steps_done * CONFIG['gradient_accumulation']
 
     print(f'\n{"="*70}')
-    print(f'  Epoch {current_epoch}/{CONFIG["num_epochs"]} | '
-          f'chunk_{chunk_info["id"]:03d}  '
+    print(f'  Chunk {chunk_idx}/{len(ALL_CHUNKS)-1} — chunk_{chunk_info["id"]:03d}  '
           f'({chunk_info["tokens"] / 1e9:.2f}B tokens)')
     print(f'{"="*70}')
 
@@ -538,15 +538,24 @@ def train_one_chunk(
     val_ds   = chunk.val_dataset(CONFIG['max_seq_len'])
 
     total_seqs = len(train_ds)
-    if batches_done >= math.ceil(total_seqs / CONFIG['batch_size']):
-        print('  ✅ Chunk déjà traité — skip')
+
+    # Calcul des batches déjà faits dans ce chunk (pour reprise mid-chunk)
+    steps_done_in_chunk   = global_step - chunk_start_step
+    batches_done_in_chunk = steps_done_in_chunk * CONFIG['gradient_accumulation']
+
+    if batches_done_in_chunk >= math.ceil(total_seqs / CONFIG['batch_size']):
+        print(f'  ✅ Chunk déjà traité intégralement — skip')
         chunk.unload()
         return global_step, total_time, chunk_start_step
 
-    # Sampler avec reprise
-    rng     = np.random.default_rng(42 + current_epoch * 1000 + cwi)
+    # Sampler avec reprise depuis où on s'était arrêté
+    rng     = np.random.default_rng(42 + chunk_idx * 1000)
     indices = rng.permutation(total_seqs)
-    indices = indices[batches_done * CONFIG['batch_size']:].tolist()
+    indices = indices[batches_done_in_chunk * CONFIG['batch_size']:].tolist()
+
+    if is_resume and batches_done_in_chunk > 0:
+        print(f'  ↩️  Reprise : {batches_done_in_chunk} batches déjà faits dans ce chunk '
+              f'({steps_done_in_chunk} steps), {len(indices)} samples restants')
 
     class IndexSampler(torch.utils.data.Sampler):
         def __init__(self, idx): self._idx = idx
@@ -577,14 +586,16 @@ def train_one_chunk(
           f'token_special={"ON" if CONFIG["use_token_special"] else "OFF"}')
 
     model.train()
-    ae, adt       = (DEVICE == 'cuda'), torch.bfloat16
+    ae  = (DEVICE == 'cuda')
+    adt = torch.bfloat16
     chunk_loss    = torch.tensor(0.0, device=DEVICE)
     valid_batches = 0
     acc_steps     = 0
     t0            = time.time()
 
     pbar = tqdm(
-        train_loader, desc=f'  E{current_epoch}C{cwi}',
+        train_loader,
+        desc=f'  C{chunk_idx}',
         initial=total_batches - len(train_loader),
         total=total_batches, leave=True, dynamic_ncols=True,
     )
@@ -614,7 +625,7 @@ def train_one_chunk(
                 acc_steps = 0
                 muon_opt.zero_grad(set_to_none=True)
                 adamw_opt.zero_grad(set_to_none=True)
-                chunk_loss = chunk_loss.detach()   # évite accumulation biaisée
+                chunk_loss = chunk_loss.detach()
                 continue
 
             loss.backward()
@@ -640,7 +651,6 @@ def train_one_chunk(
                     lr  =f'{lr:.2e}',
                 )
 
-                # Validation
                 if global_step % CONFIG['validate_every_steps'] == 0:
                     ppl, vloss = validate(model, val_loader, CONFIG['val_batches'])
                     pbar.write(f'  [val  step={global_step:,}] '
@@ -648,15 +658,14 @@ def train_one_chunk(
                     history.setdefault('validations', []).append({
                         'step': global_step, 'val_loss': vloss, 'val_ppl': ppl})
 
-                # Checkpoint
                 if global_step % CONFIG['save_every_steps'] == 0:
                     ckpt_mgr.save(model, optimizers, scheduler, {
-                        'global_step': global_step, 'current_epoch': current_epoch,
-                        'chunk_within_epoch': cwi, 'total_training_time': total_time,
-                        'chunk_start_step': chunk_start_step,
+                        'global_step'      : global_step,
+                        'current_chunk_idx': chunk_idx,
+                        'total_training_time': total_time + (time.time() - t0),
+                        'chunk_start_step' : chunk_start_step,
                     })
 
-                # Affichage graph_scale (signal Naylis)
                 if global_step % 1000 == 0:
                     raw = model._orig_mod if hasattr(model, '_orig_mod') else model
                     scales = [b.attention.graph_scale.detach().abs().mean().item()
@@ -685,9 +694,8 @@ def train_one_chunk(
           f'{elapsed / 60:.1f}min')
 
     history.setdefault('chunks', []).append({
-        'epoch': current_epoch, 'cwi': cwi,
-        'chunk_id': chunk_info['id'], 'loss': avg_loss,
-        'time_sec': elapsed, 'global_step': global_step,
+        'chunk_idx': chunk_idx, 'chunk_id': chunk_info['id'],
+        'loss': avg_loss, 'time_sec': elapsed, 'global_step': global_step,
     })
 
     chunk.unload()
@@ -728,12 +736,11 @@ def main():
     dtype = torch.bfloat16 if DEVICE == 'cuda' else torch.float32
     model = model.to(dtype).to(DEVICE)
 
-    # Vérification bf16
     if DEVICE == 'cuda':
         non_bf16 = [(n, p.dtype) for n, p in model.named_parameters()
                     if p.dtype not in (torch.bfloat16, torch.int8, torch.int32, torch.long)]
         if non_bf16:
-            print(f'  ⚠️  {len(non_bf16)} param(s) NON bf16 — vérifier init')
+            print(f'  ⚠️  {len(non_bf16)} param(s) NON bf16')
         else:
             print('  ✅ Tous les poids sont en bf16')
 
@@ -741,7 +748,6 @@ def main():
     print(f'  Params total : {p["total_M"]}M')
     print(f'  Naylis       : {p["naylis_K"]}K = {p["naylis_pct"]}')
 
-    # torch.compile
     if CONFIG['use_compile'] and DEVICE == 'cuda':
         print('\ntorch.compile...')
         import torch._dynamo as _dynamo
@@ -762,19 +768,24 @@ def main():
     )
     muon_opt, adamw_opt = optimizers
 
+    sched_total_steps = ARGS.total_steps if ARGS.total_steps is not None else TOTAL_STEPS
+    if ARGS.total_steps is not None:
+        print(f'\n  ⚠️  --total-steps forcé : {sched_total_steps:,} '
+              f'(calculé={TOTAL_STEPS:,})')
     scheduler = WSDScheduler(
         list(optimizers), max_lr=CONFIG['learning_rate'],
-        total_steps=TOTAL_STEPS, warmup_ratio=CONFIG['warmup_ratio'],
+        total_steps=sched_total_steps, warmup_ratio=CONFIG['warmup_ratio'],
         decay_ratio=CONFIG['decay_ratio'], min_lr_ratio=CONFIG['min_lr_ratio'],
     )
 
-    history             = {'config': CONFIG, 'chunks': [], 'validations': []}
-    global_step         = 0
-    current_epoch       = 1
-    chunk_within_epoch  = 0
-    total_time          = 0.0
-    chunk_start_step    = 0
+    history           = {'config': CONFIG, 'chunks': [], 'validations': []}
+    global_step       = 0
+    current_chunk_idx = 0
+    total_time        = 0.0
+    chunk_start_step  = 0
+    cp                = None
 
+    # ── Chargement checkpoint ────────────────────────────────────────────────
     cp = ckpt_mgr.load()
     if cp:
         print('\nREPRISE')
@@ -783,71 +794,95 @@ def main():
         muon_opt.load_state_dict(cp.get('muon_state_dict', {}))
         adamw_opt.load_state_dict(cp.get('adamw_state_dict', {}))
         scheduler.load_state_dict(cp.get('scheduler_state_dict', {}))
-        global_step        = cp.get('global_step', 0)
-        current_epoch      = cp.get('current_epoch', 1)
-        chunk_within_epoch = cp.get('chunk_within_epoch', 0)
-        total_time         = cp.get('total_training_time', 0.0)
-        chunk_start_step   = cp.get('chunk_start_step', 0)
-        if current_epoch > CONFIG['num_epochs']:
-            print('✅ Training déjà terminé.')
+        global_step       = cp.get('global_step', 0)
+        current_chunk_idx = cp.get('current_chunk_idx', 0)
+        total_time        = cp.get('total_training_time', 0.0)
+        chunk_start_step  = cp.get('chunk_start_step', 0)
+        print(f'  global_step={global_step:,}  chunk_idx={current_chunk_idx}  '
+              f'total_time={total_time/3600:.2f}h')
+
+        # Vérification : si le checkpoint est déjà après le dernier chunk → training terminé
+        if current_chunk_idx >= len(ALL_CHUNKS):
+            print('\n✅ Training déjà terminé sur tous les chunks disponibles.')
+            print(f'   {global_step:,} steps  |  {total_time/3600:.2f}h  |  {len(ALL_CHUNKS)} chunks')
             return
 
     print('\n' + '=' * 70)
-    print(f'  TRAINING START — {TOTAL_STEPS:,} steps')
+    print(f'  TRAINING START — {TOTAL_STEPS:,} steps estimés — {len(ALL_CHUNKS)} chunks')
     print('=' * 70)
 
-    for epoch in range(current_epoch, CONFIG['num_epochs'] + 1):
-        ep_start  = (epoch - 1) * CONFIG['chunks_per_epoch']
-        ep_chunks = ALL_TRAIN_CHUNKS[ep_start:ep_start + CONFIG['chunks_per_epoch']]
-        start_cwi = chunk_within_epoch if epoch == current_epoch else 0
+    # ── Boucle linéaire sur les chunks ──────────────────────────────────────
+    for chunk_idx, chunk_info in enumerate(ALL_CHUNKS):
 
-        print(f'\nEPOCH {epoch}/{CONFIG["num_epochs"]}')
+        # Skip les chunks déjà traités
+        if chunk_idx < current_chunk_idx:
+            print(f'  ⏩ chunk_{chunk_info["id"]:03d} (idx={chunk_idx}) — déjà traité, skip')
+            continue
 
-        for cwi in range(start_cwi, CONFIG['chunks_per_epoch']):
-            chunk_info = ep_chunks[cwi]
-            is_resume  = (epoch == current_epoch and cwi == chunk_within_epoch
-                          and cp is not None)
-            if not is_resume:
-                chunk_start_step = global_step
+        is_resume       = (cp is not None and chunk_idx == current_chunk_idx)
+        chunk_start_step = chunk_start_step if is_resume else global_step
 
-            try:
-                global_step, total_time, chunk_start_step = train_one_chunk(
-                    model=model, chunk_info=chunk_info, optimizers=optimizers,
-                    scheduler=scheduler, ckpt_mgr=ckpt_mgr, history=history,
-                    global_step=global_step, total_time=total_time,
-                    current_epoch=epoch, cwi=cwi,
-                    chunk_start_step=chunk_start_step,
-                )
-                cp = None
+        try:
+            global_step, total_time, chunk_start_step = train_one_chunk(
+                model            = model,
+                chunk_info       = chunk_info,
+                optimizers       = optimizers,
+                scheduler        = scheduler,
+                ckpt_mgr         = ckpt_mgr,
+                history          = history,
+                global_step      = global_step,
+                total_time       = total_time,
+                chunk_idx        = chunk_idx,
+                chunk_start_step = chunk_start_step,
+                is_resume        = is_resume,
+            )
+            # Chunk terminé → save de fin de chunk + avancer l'index
+            current_chunk_idx = chunk_idx + 1
+            ckpt_mgr.save(model, optimizers, scheduler, {
+                'global_step'        : global_step,
+                'current_chunk_idx'  : current_chunk_idx,
+                'total_training_time': total_time,
+                'chunk_start_step'   : global_step,   # prochain chunk démarre ici
+            })
+            cp = None  # plus de reprise en cours
 
-            except KeyboardInterrupt:
-                print('\n  CTRL+C')
-                ckpt_mgr.save(model, optimizers, scheduler, {
-                    'global_step': global_step, 'current_epoch': epoch,
-                    'chunk_within_epoch': cwi, 'total_training_time': total_time,
-                    'chunk_start_step': chunk_start_step,
-                })
-                return
+        except KeyboardInterrupt:
+            print('\n  CTRL+C — sauvegarde d\'urgence...')
+            ckpt_mgr.save(model, optimizers, scheduler, {
+                'global_step'        : global_step,
+                'current_chunk_idx'  : chunk_idx,      # chunk en cours (pas terminé)
+                'total_training_time': total_time,
+                'chunk_start_step'   : chunk_start_step,
+            })
+            print('  ✅ Sauvegarde OK — relancer le script pour reprendre')
+            return
 
-            except Exception:
-                print(f'\n  ERREUR :\n{traceback.format_exc()}')
-                ckpt_mgr.save(model, optimizers, scheduler, {
-                    'global_step': global_step, 'current_epoch': epoch,
-                    'chunk_within_epoch': cwi, 'total_training_time': total_time,
-                    'chunk_start_step': chunk_start_step,
-                })
-                raise
+        except Exception:
+            print(f'\n  ERREUR :\n{traceback.format_exc()}')
+            ckpt_mgr.save(model, optimizers, scheduler, {
+                'global_step'        : global_step,
+                'current_chunk_idx'  : chunk_idx,
+                'total_training_time': total_time,
+                'chunk_start_step'   : chunk_start_step,
+            })
+            raise
 
-        chunk_within_epoch = 0
+    # ── Fin du training ──────────────────────────────────────────────────────
+    print(f'\n{"="*70}')
+    print(f'  ✅ TRAINING TERMINÉ — tous les chunks traités')
+    print(f'{"="*70}')
+    print(f'  Steps  : {global_step:,}')
+    print(f'  Temps  : {total_time / 3600:.2f}h')
+    print(f'  Chunks : {len(ALL_CHUNKS)}')
 
-    print(f'\n{"="*70}\n  TRAINING TERMINÉ\n{"="*70}')
-    print(f'  Steps : {global_step:,}  |  Temps : {total_time / 3600:.2f}h')
-
+    # Save final (current_chunk_idx = len(ALL_CHUNKS) → signale "terminé")
     ckpt_mgr.save(model, optimizers, scheduler, {
-        'global_step': global_step, 'current_epoch': CONFIG['num_epochs'] + 1,
-        'chunk_within_epoch': 0, 'total_training_time': total_time,
-        'chunk_start_step': global_step,
+        'global_step'        : global_step,
+        'current_chunk_idx'  : len(ALL_CHUNKS),
+        'total_training_time': total_time,
+        'chunk_start_step'   : global_step,
     })
+
     hist_path = CONFIG['checkpoint_file'].replace('.pt', '_history.json')
     with open(hist_path, 'w') as f:
         json.dump(history, f, indent=2, default=str)
