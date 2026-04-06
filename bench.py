@@ -80,6 +80,9 @@ MODEL_CFG = dict(
 # ─────────────────────────────────────────────────────────────
 
 TASK_MAP_SFT = {
+    "nq_open"       : ("nq_open",         1),   # NaturalQuestions
+    "boolq"         : ("boolq",           0),
+    "lambada_openai": ("lambada_openai",  0),
     # nom_local      : (nom_lm_eval,      n_shot_sft)
     "piqa"          : ("piqa",            0),
     
@@ -92,6 +95,9 @@ TASK_MAP_SFT = {
 }
 
 TASK_MAP_PRETRAIN = {
+    "nq_open"       : ("nq_open",         0),   # NaturalQuestions
+    "boolq"         : ("boolq",           0),
+    "lambada_openai": ("lambada_openai",  0),
     # nom_local      : (nom_lm_eval,      n_shot_pretrain)
     "piqa"          : ("piqa",            0),   # tâche simple, 0-shot suffisant   
     "mmlu"          : ("mmlu",            5),   # standard académique Qwen/Gemma
@@ -112,6 +118,9 @@ RANDOM_BASELINES = {
     "arc_challenge" : 0.25,
     "hellaswag"     : 0.25,
     "winogrande"    : 0.50,
+    "nq_open"       : 0.00,   # open-ended exact match
+    "boolq"         : 0.50,   # binaire oui/non
+    "lambada"       : 0.00,
 }
 
 # ─────────────────────────────────────────────────────────────
