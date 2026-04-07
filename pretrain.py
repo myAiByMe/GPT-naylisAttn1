@@ -80,7 +80,7 @@ CONFIG = {
     'vocab_size'            : None,           # rempli après tokenizer
     'embed_dim'             : 768,
     'num_heads'             : 12,
-    'num_layers'            : 32,
+    'num_layers'            : 18,
     'max_seq_len'           : 1024,
     'dropout'               : 0.0,
     'use_rope'              : True,
