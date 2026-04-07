@@ -78,8 +78,8 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CONFIG = {
     # Modèle
     'vocab_size'            : None,           # rempli après tokenizer
-    'embed_dim'             : 1080,
-    'num_heads'             : 20,
+    'embed_dim'             : 1024,
+    'num_heads'             : 16,
     'num_layers'            : 32,
     'max_seq_len'           : 1024,
     'dropout'               : 0.0,
@@ -96,7 +96,7 @@ CONFIG = {
     # Tokens spéciaux
     'use_token_special'     : False,
     # Training
-    'batch_size'            : 32,
+    'batch_size'            : 24,
     'gradient_accumulation' : 8,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
